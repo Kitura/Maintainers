@@ -36,6 +36,7 @@ EOF
     docker push kitura/swift-dev:${version}
 done
 
+# Create variants and push to Docker HUB
 
 for variant in ci dev; do
     docker tag kitura/swift-${variant}:5.0.3 kitura/swift-${variant}:5.0
@@ -51,3 +52,24 @@ for variant in ci dev; do
     docker tag kitura/swift-${variant}:5     kitura/swift-${variant}
     docker push kitura/swift-${variant}
 done
+
+# If private repo available, push a copy there
+if [ ! -z "${KITURA_REPO}" -a ! -z "${KITURA_REPO_USER}" -a ! -z "${KITURA_REPO_PASSWORD}" ]; then
+    echo "Pushing to private repo: ${KITURA_REPO}"
+    docker login "${KITURA_REPO}" -u "${KITURA_REPO_USER}" --password-stdin <<EOF
+${KITURA_REPO_PASSWORD}
+EOF
+    for variant in ci dev; do
+        for version in \
+            5.0.3 5.1.5 5.2.5 5.3.3 \
+            5.0 5.1 5.2 5.3 \
+            5 \
+            ; do
+
+            base_tag="kitura/swift-${variant}:${version}"
+            docker tag ${base_tag} "${KITURA_REPO}"/${base_tag}
+            docker push "${KITURA_REPO}"/${base_tag}
+
+        done
+    done
+fi
