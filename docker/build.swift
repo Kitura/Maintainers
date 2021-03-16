@@ -15,6 +15,10 @@ let SwiftAliases = [
     "5.0.3" : [ "5.0" ]
     ]
 
+/// CentOS Versions to build
+let CentOSVersions = [ "8", "7" ]
+let CentOSMinimumSwiftVersion = "5.2.5"
+
 struct BuildCommand: ParsableCommand {
     static var configuration = CommandConfiguration(
         commandName: "build",
@@ -23,17 +27,23 @@ struct BuildCommand: ParsableCommand {
     @Flag(name: .shortAndLong, help: "Enable verbose mode")
     var verbose: Bool = false
         
-    @Flag(name: [.customLong("enable-build")], help: "Build docker images")
-    var enableBuild: Bool = false
+    @Flag(inversion: .prefixedEnableDisable, help: "Build docker images")
+    var build: Bool = false
     
-    @Flag(name: [.customLong("enable-push")], help: "Push docker images")
-    var enablePush: Bool = false
+    @Flag(inversion: .prefixedEnableDisable, help: "Push docker images to public registry")
+    var push: Bool = false
 
-    @Flag(name: [.customLong("enable-aliases")], help: "Tag and push convenience aliases")
-    var enableAliases: Bool = false
-    
+    @Flag(inversion: .prefixedEnableDisable, help: "Tag and push convenience aliases")
+    var aliases: Bool = false
+
+    @Flag(inversion: .prefixedEnableDisable, help: "Build Ubuntu images (required for CI)")
+    var ubuntu: Bool = true
+
+    @Flag(inversion: .prefixedEnableDisable, help: "Build CentOS images")
+    var centos: Bool = false
+
     @Flag(name: [.customLong("dry-run"), .customShort("n")], help: "Dry-run (print but do not execute commands)")
-    var enableDryRun: Bool = false // TODO: during development, set to true
+    var enableDryRun: Bool = false
 
     @Option(name: [.customLong("registry")], help: "Specify a private registry (https://[user[:password]@]registry.url)")
     var registryUrlString: String?
@@ -53,7 +63,7 @@ struct BuildCommand: ParsableCommand {
         }
         
         if enableReadRegistryPasswordFromStdin {
-            print("Enter password: ")
+            print("Enter registry password: ")
             let input = SwiftShell.main.stdin.lines()
             registryPasswordFromStdin = input.first(where: { _ in
                     return true
@@ -69,48 +79,72 @@ struct BuildCommand: ParsableCommand {
         } else {
             actions = CompositeAction([RealAction()])
         }
-
+        
         for swiftVersion in SwiftVersions {
-            let version = try! Version(swiftVersion)
+            // Determine targets to build
+            var dockerTargets: [CreateDocker] = []
             
-            let build = BuildSwiftCI(swiftVersion: swiftVersion, systemAction: actions)
-            if enableBuild {
-                actions.phase("Build docker image")
-                try build.build()
+            if ubuntu {
+                let buildCI = BuildSwiftCI(swiftVersion: swiftVersion, systemAction: actions)
+                dockerTargets.append(buildCI)
+
+                let buildDev = BuildSwiftDev(swiftVersion: swiftVersion, systemAction: actions)
+                dockerTargets.append(buildDev)
             }
             
-            if enablePush {
-                actions.phase("Push docker image to public registry")
-                try build.push()
+            if centos {
+                for centOSVersion in CentOSVersions {
+                    let swiftV = try! Version(swiftVersion)
+                    guard try! swiftV >= Version(CentOSMinimumSwiftVersion) else {
+                        break
+                    }
+                    let build = BuildCentOSCI(centOSVersion: centOSVersion, swiftVersion: swiftVersion, systemAction: actions)
+                    
+                    dockerTargets.append(build)
+                }
             }
-            
-            if enableAliases {
-                if let aliases = SwiftAliases[swiftVersion] {
-                    actions.phase("Create public aliases")
-                    for aliasVersion in aliases {
-                        try build.alias(version: swiftVersion, alias: aliasVersion)
+
+            // Perform Build
+            for target in dockerTargets {
+//            let build = BuildSwiftCI(swiftVersion: swiftVersion, systemAction: actions)
+                if build {
+                    actions.phase("Build docker image")
+                    try target.build()
+                }
+                
+                if push {
+                    actions.phase("Push docker image to public registry")
+                    try target.push()
+                }
+                
+                if aliases {
+                    if let aliases = SwiftAliases[swiftVersion] {
+                        actions.phase("Create public aliases")
+                        for aliasVersion in aliases {
+                            try target.alias(version: swiftVersion, alias: aliasVersion)
+                        }
                     }
                 }
-            }
-            
-            // Support pushing to private registry
-            if let registryUrl = registryUrl {
-                let host = registryUrl.host!
                 
-                if let user = registryUrl.user,
-                   let password = registryPasswordFromStdin ?? registryPasswordFromArg ?? registryUrl.password {
+                // Support pushing to private registry
+                if let registryUrl = registryUrl {
+                    let host = registryUrl.host!
+                    
+                    if let user = registryUrl.user,
+                       let password = registryPasswordFromStdin ?? registryPasswordFromArg ?? registryUrl.password {
 
-                    // TODO: Support --password-stdin
-                    print("Attempt to log in: \(user)  pass: \(password)")
-                    try actions.runAndPrint(command: "docker", "login", host, "-u", user, "-p", password)
+                        // TODO: Support --password-stdin
+                        print("Attempt to log in: \(user)  pass: \(password)")
+                        try actions.runAndPrint(command: "docker", "login", host, "-u", user, "-p", password)
+                    }
+
+                    actions.phase("Push docker image to private registry")
+
+                    try actions.runAndPrint(command: "docker", "tag", target.dockerTag, "\(host)/\(target.dockerTag)")
+                    
+                    try target.push(host: host)
+
                 }
-
-                actions.phase("Push docker image to private registry")
-
-                try actions.runAndPrint(command: "docker", "tag", build.dockerTag, "\(host)/\(build.dockerTag)")
-                
-                try build.push(host: host)
-
             }
         }
     }
@@ -142,7 +176,7 @@ extension CreateDocker {
 
         try self.systemAction.createDirectory(url: tmpDir)
         
-        let dockerFileUrl = tmpDir.appendingPathComponent("Docker")
+        let dockerFileUrl = tmpDir.appendingPathComponent("Dockerfile")
         
         try self.create(file: dockerFileUrl)
         
@@ -195,9 +229,12 @@ extension CreateDocker {
 
 }
 
-// MARK: Build Swift CI
+// MARK: - Build Swift CI
 
-/// Create docker image suitable for CI builds
+// MARK: Ubuntu
+
+/// Create Ubuntu based docker image suitable for CI builds.
+/// This is intended to be the minimum necessary to build Kitura projects for CI.
 class BuildSwiftCI: CreateDocker {
     let swiftVersion: String
     let dockerTag: String
@@ -214,9 +251,9 @@ class BuildSwiftCI: CreateDocker {
             """
             FROM swift:\(self.swiftVersion)
             
-            RUN apt-get update && apt-get install -y \
-            git sudo wget pkg-config libcurl4-openssl-dev libssl-dev \
-            && rm -rf /var/lib/apt/lists/*
+            RUN apt-get update && apt-get install -y \\
+                git sudo wget pkg-config libcurl4-openssl-dev libssl-dev \\
+                && rm -rf /var/lib/apt/lists/*
             
             RUN mkdir /project
             
@@ -226,7 +263,8 @@ class BuildSwiftCI: CreateDocker {
     }
 }
 
-/// Create docker image suitable for local (non-CI) development builds
+/// Create docker image suitable for local (non-CI) development builds.
+/// This is intended to be a build with packages convenient for local development of Kitura projects.
 class BuildSwiftDev: CreateDocker {
     let swiftVersion: String
     let dockerTag: String
@@ -243,9 +281,86 @@ class BuildSwiftDev: CreateDocker {
             """
             FROM kitura/swift-ci:\(self.swiftVersion)
             
-            RUN apt-get update && apt-get install -y \
-            curl net-tools iproute2 netcat \
-            && rm -rf /var/lib/apt/lists/*
+            RUN apt-get update && apt-get install -y \\
+                curl net-tools iproute2 netcat \\
+                vim \\
+                && rm -rf /var/lib/apt/lists/*
+            
+            WORKDIR /project
+            """
+        }
+    }
+}
+
+// MARK: CentOS
+
+/// Create CentOS based docker image suitable for CI
+/// This is intended to be the minimum necessary to build Kitura projects for CI.
+class BuildCentOSCI: CreateDocker {
+    let centOSVersion: String
+    let swiftVersion: String
+    let dockerTag: String
+    var systemAction: SystemAction
+    
+    init(centOSVersion: String, swiftVersion: String, systemAction: SystemAction = RealAction()) {
+        self.centOSVersion = centOSVersion
+        self.swiftVersion = swiftVersion
+        self.dockerTag = "kitura/centos\(centOSVersion)/swift-ci:\(swiftVersion)"
+        self.systemAction = systemAction
+    }
+    
+    func create(file: URL) throws {
+        let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centOSVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centOSVersion).tar.gz")!
+        let swiftTgzFilename = swiftUrl.lastPathComponent
+        let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
+        
+        try self.systemAction.createFile(fileUrl: file) {
+            """
+            FROM swift:\(swiftVersion)-centos\(centOSVersion)
+            
+            RUN yum -y install deltarpm || yum -y update && yum -y install \\
+                git sudo wget pkgconfig libcurl-devel openssl-devel \\
+                python2-libs \\
+                && yum clean all
+                        
+            RUN mkdir /project
+
+            WORKDIR /project
+            """
+        }
+    }
+}
+
+/// Create CentOS based docker image suitable for development
+/// This is intended to be a build with packages convenient for local development of Kitura projects.
+class BuildCentOSDev: CreateDocker {
+    let centOSVersion: String
+    let swiftVersion: String
+    let dockerTag: String
+    var systemAction: SystemAction
+    
+    init(centOSVersion: String, swiftVersion: String, systemAction: SystemAction = RealAction()) {
+        self.centOSVersion = centOSVersion
+        self.swiftVersion = swiftVersion
+        self.dockerTag = "kitura/centos\(centOSVersion)/swift-dev:\(swiftVersion)"
+        self.systemAction = systemAction
+    }
+    
+    func create(file: URL) throws {
+        let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centOSVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centOSVersion).tar.gz")!
+        let swiftTgzFilename = swiftUrl.lastPathComponent
+        let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
+        
+        try self.systemAction.createFile(fileUrl: file) {
+            """
+            FROM kitura/centos\(centOSVersion)/swift-dev:\(swiftVersion)
+            
+            RUN yum -y update && yum -y install \\
+                net-tools iproute nmap \\
+                vim-enhanced \\
+                && yum clean all
+                        
+            RUN mkdir /project
             
             WORKDIR /project
             """
