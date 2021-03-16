@@ -107,16 +107,12 @@ struct BuildCommand: ParsableCommand {
             // Perform Build
             for target in dockerTargets {
 //            let build = BuildSwiftCI(swiftVersion: swiftVersion, systemAction: actions)
+                actions.section("Preparing targets for \(target.dockerTag)")
                 if build {
                     actions.phase("Build docker image")
                     try target.build()
                 }
-                
-                if push {
-                    actions.phase("Push docker image to public registry")
-                    try target.push()
-                }
-                
+
                 if aliases {
                     if let aliases = SwiftAliases[swiftVersion] {
                         actions.phase("Create public aliases")
@@ -125,6 +121,19 @@ struct BuildCommand: ParsableCommand {
                         }
                     }
                 }
+
+                if push {
+                    actions.phase("Push docker image to public registry")
+                    try target.push()
+
+                    if let aliases = SwiftAliases[swiftVersion] {
+                        for aliasVersion in aliases {
+                            try target.push(version: swiftVersion, alias: aliasVersion)
+                        }
+                    }
+
+                }
+                
                 
                 // Support pushing to private registry
                 if let registryUrl = registryUrl {
@@ -162,11 +171,13 @@ protocol CreateDocker {
     var dockerTag: String { get }
 
     func create(file: URL) throws
-    func build() throws
-    func push() throws
-    func push(host: String) throws
-    func alias(version: String, alias: String) throws
-    func alias(host: String, version: String, alias: String) throws
+//    func build() throws
+//    func push() throws
+//    func push(host: String) throws
+//    func alias(version: String, alias: String) throws
+//    func alias(host: String, version: String, alias: String) throws
+//    func push(version: String, alias: String) throws
+//    func push(host: String, version: String, alias: String) throws
 }
 
 extension CreateDocker {
@@ -208,7 +219,7 @@ extension CreateDocker {
         try self._alias(host: host, version: version, alias: alias)
     }
     
-    private func _alias(host: String? = nil, version: String, alias: String) throws {
+    private func _aliasName(host: String? = nil, version: String, alias: String) -> (String, String) {
         let existingTag: String
         let aliasTag: String
         
@@ -221,12 +232,24 @@ extension CreateDocker {
             existingTag = "\(dockerBaseTag):\(version)"
             aliasTag = "\(dockerBaseTag):\(alias)"
         }
+
+        return (existingTag, aliasTag)
+    }
+    
+    private func _alias(host: String? = nil, version: String, alias: String) throws {
+        
+        let (existingTag, aliasTag) = _aliasName(host: host, version: version, alias: alias)
         
         try self.systemAction.runAndPrint(command: "docker", "tag", existingTag, aliasTag)
 
-        try self.systemAction.runAndPrint(command: "docker", "push", aliasTag)
     }
 
+    public func push(host: String? = nil, version: String, alias: String) throws {
+        
+        let (existingTag, aliasTag) = _aliasName(host: host, version: version, alias: alias)
+        
+        try self.systemAction.runAndPrint(command: "docker", "push", aliasTag)
+    }
 }
 
 // MARK: - Build Swift CI
@@ -372,14 +395,31 @@ class BuildCentOSDev: CreateDocker {
 // MARK: - SystemAction
 /// A protocol for high level operations we may perform on the system.
 /// The intent of this protocol is to make it easier to perform "dry-run" operations.
+enum Heading {
+    case section
+    case phase
+}
+
 protocol SystemAction {
-    func phase(_ string: String)
+    func heading(_ type: Heading, _ string: String)
     func createDirectory(url: URL) throws
     func createFile(fileUrl: URL, content: String) throws
     func runAndPrint(path: String?, command: [String]) throws
 }
 
 extension SystemAction {
+    /// Print the title of a section
+    /// - Parameter string: title to print
+    func section(_ string: String) {
+        self.heading(.section, string)
+    }
+    
+    /// Print the title of a phase
+    /// - Parameter string: title to print
+    func phase(_ string: String) {
+        self.heading(.phase, string)
+    }
+    
     /// Create a file at a given path.
     ///
     /// This will overwrite existing files.
@@ -391,7 +431,12 @@ extension SystemAction {
         let content = contentBuilder()
         try self.createFile(fileUrl: fileUrl, content: content)
     }
-
+    
+    /// Execute the given command and show the results
+    /// - Parameters:
+    ///   - path: If not-nil, this will be the current working directory when the command is exectued.
+    ///   - command: Command to execute
+    /// - Throws: any problems in executing the command or if the command has a non-0 return code
     func runAndPrint(path: String?=nil, command: String...) throws {
         try self.runAndPrint(path: path, command: command)
     }
@@ -399,7 +444,7 @@ extension SystemAction {
 
 /// Actually perform the function
 class RealAction: SystemAction {
-    func phase(_ string: String) {
+    func heading(_ type: Heading, _ string: String) {
         // do nothing
     }
     
@@ -435,8 +480,13 @@ class RealAction: SystemAction {
 
 /// Only print the actions
 class PrintAction: SystemAction {
-    func phase(_ string: String) {
-        print(" == Phase: \(string)".cyan.bold)
+    func heading(_ type: Heading, _ string: String) {
+        switch type {
+        case .section:
+            print(" == Section: \(string)".yellow.bold)
+        case .phase:
+            print(" -- Phase: \(string)".cyan.bold)
+        }
     }
     func createDirectory(url: URL) throws {
         print(" > Creating directory at path: \(url.path)".bold)
@@ -463,9 +513,9 @@ class CompositeAction: SystemAction {
         self.actions = actions
     }
     
-    func phase(_ string: String) {
+    func heading(_ type: Heading, _ string: String) {
         self.actions.forEach {
-            $0.phase(string)
+            $0.heading(type, string)
         }
     }
     func createDirectory(url: URL) throws {
