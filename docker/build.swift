@@ -82,13 +82,13 @@ struct BuildCommand: ParsableCommand {
         
         for swiftVersion in SwiftVersions {
             // Determine targets to build
-            var dockerTargets: [CreateDocker] = []
+            var dockerTargets: [DockerCreator] = []
             
             if ubuntu {
-                let buildCI = BuildSwiftCI(swiftVersion: swiftVersion, systemAction: actions)
+                let buildCI = DockerCreator.ubuntuCI(osVersion: "", swiftVersion: swiftVersion, systemAction: actions)
                 dockerTargets.append(buildCI)
 
-                let buildDev = BuildSwiftDev(swiftVersion: swiftVersion, systemAction: actions)
+                let buildDev = DockerCreator.ubuntuDev(osVersion: "", swiftVersion: swiftVersion, systemAction: actions)
                 dockerTargets.append(buildDev)
             }
             
@@ -98,7 +98,7 @@ struct BuildCommand: ParsableCommand {
                     guard try! swiftV >= Version(CentOSMinimumSwiftVersion) else {
                         break
                     }
-                    let build = BuildCentOSCI(centOSVersion: centOSVersion, swiftVersion: swiftVersion, systemAction: actions)
+                    let build = DockerCreator.centosCI(centOSVersion: centOSVersion, swiftVersion: swiftVersion, systemAction: actions)
                     
                     dockerTargets.append(build)
                 }
@@ -106,32 +106,26 @@ struct BuildCommand: ParsableCommand {
 
             // Perform Build
             for target in dockerTargets {
-//            let build = BuildSwiftCI(swiftVersion: swiftVersion, systemAction: actions)
-                actions.section("Preparing targets for \(target.dockerTag)")
+                actions.section("Preparing targets for \(target.dockerRef)")
+                var aliasesToPush: [DockerCreator] = []
+                
                 if build {
                     actions.phase("Build docker image")
                     try target.build()
                 }
 
                 if aliases {
-                    if let aliases = SwiftAliases[swiftVersion] {
+                    if let swiftAliases = SwiftAliases[swiftVersion] {
                         actions.phase("Create public aliases")
-                        for aliasVersion in aliases {
-                            try target.alias(version: swiftVersion, alias: aliasVersion)
-                        }
+                        let newAliases = try target.aliases(tags: swiftAliases)
+                        aliasesToPush.append(contentsOf: newAliases)
                     }
                 }
 
                 if push {
                     actions.phase("Push docker image to public registry")
                     try target.push()
-
-                    if let aliases = SwiftAliases[swiftVersion] {
-                        for aliasVersion in aliases {
-                            try target.push(version: swiftVersion, alias: aliasVersion)
-                        }
-                    }
-
+                    try aliasesToPush.push()
                 }
                 
                 
@@ -142,16 +136,30 @@ struct BuildCommand: ParsableCommand {
                     if let user = registryUrl.user,
                        let password = registryPasswordFromStdin ?? registryPasswordFromArg ?? registryUrl.password {
 
+                        actions.phase("Login to private docker registry")
+
                         // TODO: Support --password-stdin
                         print("Attempt to log in: \(user)  pass: \(password)")
                         try actions.runAndPrint(command: "docker", "login", host, "-u", user, "-p", password)
                     }
 
-                    actions.phase("Push docker image to private registry")
+                    actions.phase("Create tag for private registry")
+                    let privateTarget = try target.tag(hostname: host, port: registryUrl.port)
+                    var aliasesToPush: [DockerCreator] = []
 
-                    try actions.runAndPrint(command: "docker", "tag", target.dockerTag, "\(host)/\(target.dockerTag)")
-                    
-                    try target.push(host: host)
+                    if aliases {
+                       if let aliases = SwiftAliases[swiftVersion] {
+                            actions.phase("Create aliases for private registry")
+                            let newAliases = try privateTarget.aliases(tags: aliases)
+                            aliasesToPush.append(contentsOf: newAliases)
+                       }
+                    }
+
+                        
+                    if push {
+                        actions.phase("Pushing alias to private registry")
+                        try aliasesToPush.push()
+                    }
 
                 }
             }
@@ -162,93 +170,97 @@ struct BuildCommand: ParsableCommand {
 
 BuildCommand.main()
 
-// MARK: CreateDocker
-
 /// Abstract protocol for creating docker images
-protocol CreateDocker {
-    var systemAction: SystemAction { get set }
-    var swiftVersion: String { get }
-    var dockerTag: String { get }
-
-    func create(file: URL) throws
-//    func build() throws
-//    func push() throws
-//    func push(host: String) throws
-//    func alias(version: String, alias: String) throws
-//    func alias(host: String, version: String, alias: String) throws
-//    func push(version: String, alias: String) throws
-//    func push(host: String, version: String, alias: String) throws
-}
-
-extension CreateDocker {
+struct DockerCreator {
+    let os: String
+    let osVersion: String
+    let systemAction: SystemAction
+    let dockerRef: DockerImageRef
+    let dockerFile: String
+    
+    public func with(tag newTag: String) -> DockerCreator {
+        
+        let newDockerRef = self.dockerRef.with(tag: newTag)
+        
+        return self.with(ref: newDockerRef)
+    }
+    
+    public func with(ref newDockerRef: DockerImageRef) -> DockerCreator {
+        return DockerCreator(os: self.os,
+                             osVersion: self.osVersion,
+                             systemAction: self.systemAction,
+                             dockerRef: newDockerRef,
+                             dockerFile: self.dockerFile)
+    }
+    
+    public func with(hostname: String, port: Int?) -> DockerCreator {
+        let newDockerRef = self.dockerRef.with(hostname: hostname, port: port)
+        return self.with(ref: newDockerRef)
+    }
+    
+    private func create(file: URL) throws {
+        try self.systemAction.createFile(fileUrl: file) {
+            return self.dockerFile
+        }
+    }
+    
     func build() throws {
         let fm = FileManager.default
         let tmpDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-
+        
         try self.systemAction.createDirectory(url: tmpDir)
         
         let dockerFileUrl = tmpDir.appendingPathComponent("Dockerfile")
         
-        try self.create(file: dockerFileUrl)
-        
-        try self.systemAction.runAndPrint(path: tmpDir.path, command: "docker", "build", "-t", self.dockerTag, tmpDir.path)
+        try self.systemAction.createFile(fileUrl: dockerFileUrl) {
+            self.dockerFile
+        }
+
+        try self.systemAction.runAndPrint(path: tmpDir.path, command: "docker", "build", "-t", "\(self.dockerRef)", tmpDir.path)
     }
     
+    /// Create an alias of a docker ref with a new tag
+    ///
+    /// - Parameter tag: New tag to use
+    /// - Returns: DockerCreator with the new tag
+    @discardableResult
+    func alias(tag: String) throws -> DockerCreator {
+        let newDockerRef = self.dockerRef.with(tag: tag)
+        let existingRef = self.dockerRef.description
+        
+        try self.systemAction.runAndPrint(command: "docker", "tag", existingRef, newDockerRef.tag)
+
+        return self.with(ref: newDockerRef)
+    }
+    
+    /// Create multiple aliases
+    /// - Parameter tags: New tags to create
+    /// - Returns: An array of `DockerCreator` containing all tags created
+    func aliases(tags: [String]) throws -> [DockerCreator] {
+        return try tags.map { try self.alias(tag: $0) }
+    }
+    
+    /// Perform a `docker push`
+    /// - Throws: Errors from executing `docker push`
     func push() throws {
-        try self._push()
-    }
-    
-    func push(host: String) throws {
-        try self._push(host: host)
-    }
-    
-    private func _push(host: String? = nil) throws {
-        let tag: String
-        if let host = host {
-            tag = "\(host)/\(self.dockerTag)"
-        } else {
-            tag = self.dockerTag
-        }
-        try self.systemAction.runAndPrint(command: "docker", "push", tag)
-    }
-    func alias(version: String, alias: String) throws {
-        try self._alias(version: version, alias: alias)
-    }
-    
-    func alias(host: String, version: String, alias: String) throws {
-        try self._alias(host: host, version: version, alias: alias)
-    }
-    
-    private func _aliasName(host: String? = nil, version: String, alias: String) -> (String, String) {
-        let existingTag: String
-        let aliasTag: String
-        
-        let dockerBaseTag = self.dockerTag.components(separatedBy: ":")[0]
-        
-        if let host = host {
-            existingTag = "\(host)/\(dockerBaseTag):\(version)"
-            aliasTag = "\(host)/\(dockerBaseTag):\(alias)"
-        } else {
-            existingTag = "\(dockerBaseTag):\(version)"
-            aliasTag = "\(dockerBaseTag):\(alias)"
-        }
-
-        return (existingTag, aliasTag)
-    }
-    
-    private func _alias(host: String? = nil, version: String, alias: String) throws {
-        
-        let (existingTag, aliasTag) = _aliasName(host: host, version: version, alias: alias)
-        
-        try self.systemAction.runAndPrint(command: "docker", "tag", existingTag, aliasTag)
-
+        try self.systemAction.runAndPrint(command: "docker", "push", "\(self.dockerRef)")
     }
 
-    public func push(host: String? = nil, version: String, alias: String) throws {
+    
+    /// Create a tag for a private Docker registry
+    /// - Parameters:
+    ///   - hostname: Hostname of the private registry
+    ///   - port: Optional port number for the private registry
+    /// - Throws: Any errors from `docker tag`
+    /// - Returns: new `DockerCreator`
+    func tag(hostname: String, port: Int?) throws -> DockerCreator {
+        let existingRef = self.dockerRef
+        let newDockerCreator = self.with(hostname: hostname, port: port)
+        let newRef = newDockerCreator.dockerRef
         
-        let (existingTag, aliasTag) = _aliasName(host: host, version: version, alias: alias)
+        try self.systemAction.runAndPrint(command: "docker", "tag", "\(existingRef)", "\(newRef)")
         
-        try self.systemAction.runAndPrint(command: "docker", "push", aliasTag)
+        return newDockerCreator
     }
 }
 
@@ -256,23 +268,14 @@ extension CreateDocker {
 
 // MARK: Ubuntu
 
-/// Create Ubuntu based docker image suitable for CI builds.
-/// This is intended to be the minimum necessary to build Kitura projects for CI.
-class BuildSwiftCI: CreateDocker {
-    let swiftVersion: String
-    let dockerTag: String
-    var systemAction: SystemAction
+extension DockerCreator {
     
-    init(swiftVersion: String, systemAction: SystemAction = RealAction()) {
-        self.swiftVersion = swiftVersion
-        self.dockerTag = "kitura/swift-ci:\(swiftVersion)"
-        self.systemAction = systemAction
-    }
-    
-    func create(file: URL) throws {
-        try self.systemAction.createFile(fileUrl: file) {
-            """
-            FROM swift:\(self.swiftVersion)
+    /// Create Ubuntu based docker image suitable for CI builds.
+    /// This is intended to be the minimum necessary to build Kitura projects for CI.
+    static func ubuntuCI(osVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/swift-ci", tag: swiftVersion)
+        let dockerFile = """
+            FROM swift:\(swiftVersion)
             
             RUN apt-get update && apt-get install -y \\
                 git sudo wget pkg-config libcurl4-openssl-dev libssl-dev \\
@@ -282,27 +285,16 @@ class BuildSwiftCI: CreateDocker {
             
             WORKDIR /project
             """
-        }
-    }
-}
-
-/// Create docker image suitable for local (non-CI) development builds.
-/// This is intended to be a build with packages convenient for local development of Kitura projects.
-class BuildSwiftDev: CreateDocker {
-    let swiftVersion: String
-    let dockerTag: String
-    var systemAction: SystemAction
-    
-    init(swiftVersion: String, systemAction: SystemAction = RealAction()) {
-        self.swiftVersion = swiftVersion
-        self.dockerTag = "kitura/swift-dev:\(swiftVersion)"
-        self.systemAction = systemAction
+        
+        return DockerCreator(os: "ubuntu", osVersion: osVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
     
-    func create(file: URL) throws {
-        try self.systemAction.createFile(fileUrl: file) {
-            """
-            FROM kitura/swift-ci:\(self.swiftVersion)
+    /// Create docker image suitable for local (non-CI) development builds.
+    /// This is intended to be a build with packages convenient for local development of Kitura projects.
+    static func ubuntuDev(osVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/swift-dev", tag: swiftVersion)
+        let dockerFile = """
+            FROM kitura/swift-ci:\(swiftVersion)
             
             RUN apt-get update && apt-get install -y \\
                 curl net-tools iproute2 netcat \\
@@ -311,71 +303,45 @@ class BuildSwiftDev: CreateDocker {
             
             WORKDIR /project
             """
-        }
-    }
-}
-
-// MARK: CentOS
-
-/// Create CentOS based docker image suitable for CI
-/// This is intended to be the minimum necessary to build Kitura projects for CI.
-class BuildCentOSCI: CreateDocker {
-    let centOSVersion: String
-    let swiftVersion: String
-    let dockerTag: String
-    var systemAction: SystemAction
-    
-    init(centOSVersion: String, swiftVersion: String, systemAction: SystemAction = RealAction()) {
-        self.centOSVersion = centOSVersion
-        self.swiftVersion = swiftVersion
-        self.dockerTag = "kitura/centos\(centOSVersion)/swift-ci:\(swiftVersion)"
-        self.systemAction = systemAction
+        
+        return DockerCreator(os: "ubuntu", osVersion: osVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
     
-    func create(file: URL) throws {
+    // MARK: CentOS
+    
+    /// Create CentOS based docker image suitable for CI
+    /// This is intended to be the minimum necessary to build Kitura projects for CI.
+
+    static func centosCI(centOSVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/centos\(centOSVersion)/swift-ci", tag: swiftVersion)
         let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centOSVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centOSVersion).tar.gz")!
         let swiftTgzFilename = swiftUrl.lastPathComponent
         let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
-        
-        try self.systemAction.createFile(fileUrl: file) {
-            """
+
+        let dockerFile = """
             FROM swift:\(swiftVersion)-centos\(centOSVersion)
+                
+                RUN yum -y install deltarpm || yum -y update && yum -y install \\
+                    git sudo wget pkgconfig libcurl-devel openssl-devel \\
+                    python2-libs \\
+                    && yum clean all
+                            
+                RUN mkdir /project
             
-            RUN yum -y install deltarpm || yum -y update && yum -y install \\
-                git sudo wget pkgconfig libcurl-devel openssl-devel \\
-                python2-libs \\
-                && yum clean all
-                        
-            RUN mkdir /project
-
-            WORKDIR /project
+                WORKDIR /project
             """
-        }
-    }
-}
 
-/// Create CentOS based docker image suitable for development
-/// This is intended to be a build with packages convenient for local development of Kitura projects.
-class BuildCentOSDev: CreateDocker {
-    let centOSVersion: String
-    let swiftVersion: String
-    let dockerTag: String
-    var systemAction: SystemAction
-    
-    init(centOSVersion: String, swiftVersion: String, systemAction: SystemAction = RealAction()) {
-        self.centOSVersion = centOSVersion
-        self.swiftVersion = swiftVersion
-        self.dockerTag = "kitura/centos\(centOSVersion)/swift-dev:\(swiftVersion)"
-        self.systemAction = systemAction
+        return DockerCreator(os: "centos", osVersion: centOSVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
     
-    func create(file: URL) throws {
+    /// Create CentOS based docker image suitable for development
+    /// This is intended to be a build with packages convenient for local development of Kitura projects.
+    static func centosDev(centOSVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/centos\(centOSVersion)/swift-dev", tag: swiftVersion)
         let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centOSVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centOSVersion).tar.gz")!
         let swiftTgzFilename = swiftUrl.lastPathComponent
         let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
-        
-        try self.systemAction.createFile(fileUrl: file) {
-            """
+        let dockerFile = """
             FROM kitura/centos\(centOSVersion)/swift-dev:\(swiftVersion)
             
             RUN yum -y update && yum -y install \\
@@ -387,6 +353,16 @@ class BuildCentOSDev: CreateDocker {
             
             WORKDIR /project
             """
+        
+        return DockerCreator(os: "centos", osVersion: centOSVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
+    }
+}
+
+
+extension Array where Element == DockerCreator {
+    func push() throws {
+        for dockerCreator in self {
+            try dockerCreator.push()
         }
     }
 }
@@ -533,6 +509,65 @@ class CompositeAction: SystemAction {
     func runAndPrint(path: String?, command: [String]) throws {
         try self.actions.forEach {
             try $0.runAndPrint(path: path, command: command)
+        }
+    }
+}
+
+// MARK: Docker Image Ref
+
+public struct DockerImageRef {
+    public struct HostInfo {
+        let hostname: String
+        let port: Int?
+    }
+    let host: HostInfo?
+    let name: String
+    let tag: String
+    
+    public init(host: HostInfo? = nil, name: String, tag: String = "latest") {
+        self.host = host
+        self.name = name
+        self.tag = tag
+    }
+    
+    /// Duplicate a DockerImageRef and assign a private registry.
+    ///
+    /// The newly created DockerImageRef will have the same name and tag as the original.
+    /// - Parameters:
+    ///   - hostname: hostname of private registry
+    ///   - port: optional port for private registry
+    /// - Returns: new DockerImageRef
+    public func with(hostname: String, port: Int?=nil) -> DockerImageRef {
+        let hostInfo = HostInfo(hostname: hostname, port: port)
+        return DockerImageRef(host: hostInfo, name: self.name, tag: self.tag)
+    }
+    
+    /// Duplicate a DockerImageRef and assign a new tag.
+    ///
+    /// The newly created DockerImageRef will have the same name and private registery (if one previously specified).
+    /// - Parameter tag: Tag to assign to new DockerImageRef
+    /// - Returns: new DockerImageRef
+    public func with(tag newTag: String) -> DockerImageRef {
+        return DockerImageRef(host: self.host, name: self.name, tag: newTag)
+    }
+}
+
+extension DockerImageRef.HostInfo: CustomStringConvertible {
+    public var description: String {
+        if let port = port {
+            return "\(hostname):\(port)"
+        } else {
+            return "\(hostname)"
+        }
+    }
+}
+
+extension DockerImageRef: CustomStringConvertible {
+    public var description: String {
+        if let host = host {
+            return "\(host)/\(name):\(tag)"
+        } else {
+            return "\(name):\(tag)"
         }
     }
 }
