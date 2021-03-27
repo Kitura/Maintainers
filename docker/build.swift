@@ -33,8 +33,14 @@ struct BuildCommand: ParsableCommand {
     @Flag(inversion: .prefixedEnableDisable, help: "Build docker images")
     var build: Bool = false
     
-    @Flag(inversion: .prefixedEnableDisable, help: "Push docker images to public registry")
+    @Flag(inversion: .prefixedEnableDisable, help: "Push docker images to registry")
     var push: Bool = false
+
+    @Flag(inversion: .prefixedEnableDisable, help: "Push docker images to public registry")
+    var pushPublic: Bool = false
+
+    @Flag(inversion: .prefixedEnableDisable, help: "Push docker images to private registry")
+    var pushPrivate: Bool = false
 
     @Flag(inversion: .prefixedEnableDisable, help: "Tag and push convenience aliases")
     var aliases: Bool = false
@@ -148,7 +154,7 @@ struct BuildCommand: ParsableCommand {
             try targetsToAlias.tag()
         }
         
-        if push {
+        if push || pushPublic {
             actions.section("Push docker image to public registry")
             
             try targetsPublic.push()
@@ -179,7 +185,7 @@ struct BuildCommand: ParsableCommand {
                 try privateTargetsToAlias.tag()
             }
             
-            if push {
+            if push || pushPrivate {
                 actions.section("Push docker images to private registry")
                 try targetsPrivateAliases.push()
                 
