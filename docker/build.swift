@@ -15,9 +15,12 @@ let SwiftAliases = [
     "5.0.3" : [ "5.0" ]
     ]
 
+/// Ubuntu Versions to build
+let UbuntuVersions = [ "18.04", "20.04" ] // first in this list will be the "default"
+
 /// CentOS Versions to build
-let CentOSVersions = [ "8", "7" ]
-let CentOSMinimumSwiftVersion = "5.2.5"
+let CentosVersions = [ "8", "7" ]
+let CentosMinimumSwiftVersion = "5.2.5"
 
 struct BuildCommand: ParsableCommand {
     static var configuration = CommandConfiguration(
@@ -83,22 +86,37 @@ struct BuildCommand: ParsableCommand {
         for swiftVersion in SwiftVersions {
             // Determine targets to build
             var dockerTargets: [DockerCreator] = []
+            var defaultTargets: [DockerImageRef : DockerImageRef] = [:]
             
             if ubuntu {
-                let buildCI = DockerCreator.ubuntuCI(osVersion: "", swiftVersion: swiftVersion, systemAction: actions)
-                dockerTargets.append(buildCI)
+                for osVersion in UbuntuVersions {
+                    let buildCI = DockerCreator.ubuntuCI(osVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions)
+                    dockerTargets.append(buildCI)
 
-                let buildDev = DockerCreator.ubuntuDev(osVersion: "", swiftVersion: swiftVersion, systemAction: actions)
-                dockerTargets.append(buildDev)
+                    let buildDev = DockerCreator.ubuntuDev(osVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions)
+                    dockerTargets.append(buildDev)
+                    
+                    
+                    if aliases {
+                        if osVersion == UbuntuVersions.first {
+                            // Setup "default" refs that do not have the OS label attached
+                            // Need to save them here because they don't exist until after the build phase
+                            let defaultCIRef = DockerImageRef(name: "kitura/swift-ci", tag: swiftVersion)
+                            let defaultDevRef = DockerImageRef(name: "kitura/swift-dev", tag: swiftVersion)
+                            defaultTargets[ buildCI.dockerRef ] = defaultCIRef
+                            defaultTargets[ buildDev.dockerRef ] = defaultDevRef
+                        }
+                    }
+                }
             }
             
             if centos {
-                for centOSVersion in CentOSVersions {
+                for osVersion in CentosVersions {
                     let swiftV = try! Version(swiftVersion)
-                    guard try! swiftV >= Version(CentOSMinimumSwiftVersion) else {
+                    guard try! swiftV >= Version(CentosMinimumSwiftVersion) else {
                         break
                     }
-                    let build = DockerCreator.centosCI(centOSVersion: centOSVersion, swiftVersion: swiftVersion, systemAction: actions)
+                    let build = DockerCreator.centosCI(centosVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions)
                     
                     dockerTargets.append(build)
                 }
@@ -117,8 +135,20 @@ struct BuildCommand: ParsableCommand {
                 if aliases {
                     if let swiftAliases = SwiftAliases[swiftVersion] {
                         actions.phase("Create public aliases")
-                        let newAliases = try target.aliases(tags: swiftAliases)
-                        aliasesToPush.append(contentsOf: newAliases)
+                        let aliasedTargets = try target.aliases(tags: swiftAliases)
+                        aliasesToPush.append(contentsOf: aliasedTargets)
+                        
+                        // If this is a "default" setup the aliases
+                        for aliasedTarget in aliasedTargets {
+                            guard let targetRef = defaultTargets[aliasedTarget.dockerRef] else {
+                                continue
+                            }
+                            
+                            let newTarget = try aliasedTarget.alias(ref: targetRef)
+                            if swiftVersionIsLatest(swiftVersion) {
+                                try newTarget.alias(tag: "latest")
+                            }
+                        }
                     }
                 }
 
@@ -170,7 +200,10 @@ struct BuildCommand: ParsableCommand {
 
 BuildCommand.main()
 
-/// Abstract protocol for creating docker images
+
+// MARK: - DockerCreator
+
+/// Helper manage docker container variants
 struct DockerCreator {
     let os: String
     let osVersion: String
@@ -226,13 +259,22 @@ struct DockerCreator {
     @discardableResult
     func alias(tag: String) throws -> DockerCreator {
         let newDockerRef = self.dockerRef.with(tag: tag)
-        let existingRef = self.dockerRef.description
-        
-        try self.systemAction.runAndPrint(command: "docker", "tag", existingRef, newDockerRef.tag)
-
-        return self.with(ref: newDockerRef)
+        return try self.alias(ref: newDockerRef)
     }
     
+    /// Tag with a new name entirely
+    /// - Parameter newDockerRef: New docker ref to tag with
+    /// - Throws: Any errors running `docker tag`
+    /// - Returns: `DockerCreator` with the new `DockerImageRef`
+    @discardableResult
+    func alias(ref newDockerRef: DockerImageRef) throws -> DockerCreator {
+        let existingRef = self.dockerRef
+        
+        try self.systemAction.runAndPrint(command: "docker", "tag", "\(existingRef)", "\(newDockerRef)")
+        
+        return self.with(ref: newDockerRef)
+    }
+
     /// Create multiple aliases
     /// - Parameter tags: New tags to create
     /// - Returns: An array of `DockerCreator` containing all tags created
@@ -264,18 +306,45 @@ struct DockerCreator {
     }
 }
 
-// MARK: - Build Swift CI
+// MARK: - Misc Helper Functions
 
-// MARK: Ubuntu
+/// Determine if the given swift version is the "latest".
+///
+/// The latest is determined by whether the alias contains the "latest" keyword
+/// - Parameter swiftVersion: Swift Version to check
+/// - Returns: true if it is "latest"
+func swiftVersionIsLatest(_ swiftVersion: String) -> Bool {
+    guard let aliases = SwiftAliases[swiftVersion] else {
+        return false
+    }
+    return aliases.contains("latest")
+}
+
+
+// MARK: - Container descriptions
 
 extension DockerCreator {
+    
+    // MARK: Ubuntu
+    
+    private static func ubuntuOSName(version: String) -> String? {
+        switch version {
+        case "20.04": return "focal"
+        case "18.04": return "bionic"
+        case "16.04": return "xenial"
+        default:
+            return nil
+        }
+    }
     
     /// Create Ubuntu based docker image suitable for CI builds.
     /// This is intended to be the minimum necessary to build Kitura projects for CI.
     static func ubuntuCI(osVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
-        let dockerRef = DockerImageRef(name: "kitura/swift-ci", tag: swiftVersion)
+        let ubuntuOSName = self.ubuntuOSName(version: osVersion)!
+        
+        let dockerRef = DockerImageRef(name: "kitura/ubuntu\(osVersion)/swift-ci", tag: swiftVersion)
         let dockerFile = """
-            FROM swift:\(swiftVersion)
+            FROM swift:\(swiftVersion)-\(ubuntuOSName)
             
             RUN apt-get update && apt-get install -y \\
                 git sudo wget pkg-config libcurl4-openssl-dev libssl-dev \\
@@ -292,9 +361,9 @@ extension DockerCreator {
     /// Create docker image suitable for local (non-CI) development builds.
     /// This is intended to be a build with packages convenient for local development of Kitura projects.
     static func ubuntuDev(osVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
-        let dockerRef = DockerImageRef(name: "kitura/swift-dev", tag: swiftVersion)
+        let dockerRef = DockerImageRef(name: "kitura/ubuntu\(osVersion)/swift-dev", tag: swiftVersion)
         let dockerFile = """
-            FROM kitura/swift-ci:\(swiftVersion)
+            FROM kitura/ubuntu\(osVersion)/swift-ci:\(swiftVersion)
             
             RUN apt-get update && apt-get install -y \\
                 curl net-tools iproute2 netcat \\
@@ -312,14 +381,14 @@ extension DockerCreator {
     /// Create CentOS based docker image suitable for CI
     /// This is intended to be the minimum necessary to build Kitura projects for CI.
 
-    static func centosCI(centOSVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
-        let dockerRef = DockerImageRef(name: "kitura/centos\(centOSVersion)/swift-ci", tag: swiftVersion)
-        let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centOSVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centOSVersion).tar.gz")!
-        let swiftTgzFilename = swiftUrl.lastPathComponent
-        let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
+    static func centosCI(centosVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/centos\(centosVersion)/swift-ci", tag: swiftVersion)
+//        let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centosVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centosVersion).tar.gz")!
+//        let swiftTgzFilename = swiftUrl.lastPathComponent
+//        let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
 
         let dockerFile = """
-            FROM swift:\(swiftVersion)-centos\(centOSVersion)
+            FROM swift:\(swiftVersion)-centos\(centosVersion)
                 
                 RUN yum -y install deltarpm || yum -y update && yum -y install \\
                     git sudo wget pkgconfig libcurl-devel openssl-devel \\
@@ -331,18 +400,16 @@ extension DockerCreator {
                 WORKDIR /project
             """
 
-        return DockerCreator(os: "centos", osVersion: centOSVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
+        return DockerCreator(os: "centos", osVersion: centosVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
     
     /// Create CentOS based docker image suitable for development
     /// This is intended to be a build with packages convenient for local development of Kitura projects.
-    static func centosDev(centOSVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
-        let dockerRef = DockerImageRef(name: "kitura/centos\(centOSVersion)/swift-dev", tag: swiftVersion)
-        let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centOSVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centOSVersion).tar.gz")!
-        let swiftTgzFilename = swiftUrl.lastPathComponent
-        let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
+    static func centosDev(centosVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/centos\(centosVersion)/swift-dev", tag: swiftVersion)
+
         let dockerFile = """
-            FROM kitura/centos\(centOSVersion)/swift-dev:\(swiftVersion)
+            FROM kitura/centos\(centosVersion)/swift-dev:\(swiftVersion)
             
             RUN yum -y update && yum -y install \\
                 net-tools iproute nmap \\
@@ -354,12 +421,14 @@ extension DockerCreator {
             WORKDIR /project
             """
         
-        return DockerCreator(os: "centos", osVersion: centOSVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
+        return DockerCreator(os: "centos", osVersion: centosVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
 }
 
 
 extension Array where Element == DockerCreator {
+    /// Convenience method to  apply push() to an array of `DockerCreator`s
+    /// - Throws: Any errors on `docker push`
     func push() throws {
         for dockerCreator in self {
             try dockerCreator.push()
@@ -515,8 +584,8 @@ class CompositeAction: SystemAction {
 
 // MARK: Docker Image Ref
 
-public struct DockerImageRef {
-    public struct HostInfo {
+public struct DockerImageRef: Hashable {
+    public struct HostInfo: Hashable {
         let hostname: String
         let port: Int?
     }
