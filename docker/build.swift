@@ -205,13 +205,6 @@ struct DockerCreator {
     let dockerRef: DockerImageRef
     let dockerFile: String
     
-    public func with(tag newTag: String) -> DockerCreator {
-        
-        let newDockerRef = self.dockerRef.with(tag: newTag)
-        
-        return self.with(ref: newDockerRef)
-    }
-    
     public func with(ref newDockerRef: DockerImageRef) -> DockerCreator {
         return DockerCreator(os: self.os,
                              osVersion: self.osVersion,
@@ -220,17 +213,16 @@ struct DockerCreator {
                              dockerFile: self.dockerFile)
     }
     
-    public func with(hostname: String, port: Int?) -> DockerCreator {
-        let newDockerRef = self.dockerRef.with(hostname: hostname, port: port)
-        return self.with(ref: newDockerRef)
-    }
-    
     private func create(file: URL) throws {
         try self.systemAction.createFile(fileUrl: file) {
             return self.dockerFile
         }
     }
     
+    /// Build the docker
+    ///
+    /// Perform a `docker build`
+    /// - Throws: Any errors running `docker tag` or creating the `Dockerfile`
     func build() throws {
         let fm = FileManager.default
         let tmpDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -246,58 +238,29 @@ struct DockerCreator {
         try self.systemAction.runAndPrint(path: tmpDir.path, command: "docker", "build", "-t", "\(self.dockerRef)", tmpDir.path)
     }
     
-    /// Create an alias of a docker ref with a new tag
+    /// Tag with a new name entirely.
     ///
-    /// - Parameter tag: New tag to use
-    /// - Returns: DockerCreator with the new tag
-    @discardableResult
-    func alias(tag: String) throws -> DockerCreator {
-        let newDockerRef = self.dockerRef.with(tag: tag)
-        return try self.alias(ref: newDockerRef)
-    }
-    
-    /// Tag with a new name entirely
+    /// Perform a `docker tag`
     /// - Parameter newDockerRef: New docker ref to tag with
     /// - Throws: Any errors running `docker tag`
     /// - Returns: `DockerCreator` with the new `DockerImageRef`
     @discardableResult
-    func alias(ref newDockerRef: DockerImageRef) throws -> DockerCreator {
+    func tag(ref newDockerRef: DockerImageRef) throws -> DockerCreator {
         let existingRef = self.dockerRef
         
         try self.systemAction.runAndPrint(command: "docker", "tag", "\(existingRef)", "\(newDockerRef)")
         
         return self.with(ref: newDockerRef)
     }
-
-    /// Create multiple aliases
-    /// - Parameter tags: New tags to create
-    /// - Returns: An array of `DockerCreator` containing all tags created
-    func aliases(tags: [String]) throws -> [DockerCreator] {
-        return try tags.map { try self.alias(tag: $0) }
-    }
     
+    /// Push to registry.
+    ///
     /// Perform a `docker push`
     /// - Throws: Errors from executing `docker push`
     func push() throws {
         try self.systemAction.runAndPrint(command: "docker", "push", "\(self.dockerRef)")
     }
 
-    
-    /// Create a tag for a private Docker registry
-    /// - Parameters:
-    ///   - hostname: Hostname of the private registry
-    ///   - port: Optional port number for the private registry
-    /// - Throws: Any errors from `docker tag`
-    /// - Returns: new `DockerCreator`
-    func tag(hostname: String, port: Int?) throws -> DockerCreator {
-        let existingRef = self.dockerRef
-        let newDockerCreator = self.with(hostname: hostname, port: port)
-        let newRef = newDockerCreator.dockerRef
-        
-        try self.systemAction.runAndPrint(command: "docker", "tag", "\(existingRef)", "\(newRef)")
-        
-        return newDockerCreator
-    }
 }
 
 // MARK: Docker Alias
@@ -312,7 +275,7 @@ struct DockerAlias {
     /// Create the alias
     /// - Throws: Any errors from `docker tag`
     func tag() throws {
-        try self.dockerCreator.alias(ref: self.targetRef)
+        try self.dockerCreator.tag(ref: self.targetRef)
     }
     
     /// Push the alias to the registry
