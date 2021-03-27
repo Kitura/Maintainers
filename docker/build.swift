@@ -60,7 +60,9 @@ struct BuildCommand: ParsableCommand {
     
     mutating func run() throws {
         var registryPasswordFromStdin: String? = nil
-        
+        var targetsToBuild: [DockerCreator] = []
+        var targetsToAlias: [DockerAlias] = []
+
         if let urlString = self.registryUrlString {
             self.registryUrl = URL(string: urlString)
         }
@@ -83,12 +85,9 @@ struct BuildCommand: ParsableCommand {
             actions = CompositeAction([RealAction()])
         }
         
-        var targetsToPush: [DockerCreator] = []
 
         for swiftVersion in SwiftVersions {
             // Determine targets to build
-            var dockerTargets: [DockerCreator] = []
-            var defaultTargets: [DockerImageRef : DockerImageRef] = [:]
             
             if ubuntu {
                 for osVersion in UbuntuVersions {
@@ -98,10 +97,10 @@ struct BuildCommand: ParsableCommand {
                     }
 
                     let buildCI = DockerCreator.ubuntuCI(osVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions)
-                    dockerTargets.append(buildCI)
+                    targetsToBuild.append(buildCI)
 
                     let buildDev = DockerCreator.ubuntuDev(osVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions)
-                    dockerTargets.append(buildDev)
+                    targetsToBuild.append(buildDev)
                     
                     
                     // Setup "default" refs that do not have the OS label attached
@@ -109,108 +108,88 @@ struct BuildCommand: ParsableCommand {
                         // Need to save them in defaultTargets[] because they don't exist until after the build phase
                         let defaultCIRef = DockerImageRef(name: "kitura/swift-ci", tag: swiftVersion)
                         let defaultDevRef = DockerImageRef(name: "kitura/swift-dev", tag: swiftVersion)
-                        defaultTargets[ buildCI.dockerRef ] = defaultCIRef
-                        defaultTargets[ buildDev.dockerRef ] = defaultDevRef
+                        targetsToAlias.append(.init(dockerCreator: buildCI, targetRef: defaultCIRef))
+                        targetsToAlias.append(.init(dockerCreator: buildDev, targetRef: defaultDevRef))
+                        
                     }
                 }
             }
             
             if centos {
                 for osVersion in CentosVersions {
-                    let swiftV = try! Version(swiftVersion)
-                    guard try! swiftV >= Version(CentosMinimumSwiftVersion) else {
+                    guard try! Version(swiftVersion) >= Version(CentosMinimumSwiftVersion) else {
                         break
                     }
-                    dockerTargets.append(contentsOf: [
+                    targetsToBuild.append(contentsOf: [
                         DockerCreator.centosCI(centosVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions),
                         DockerCreator.centosDev(centosVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions),
                     ])
                 }
             }
+                            
+        }
+        
+        if build {
+            actions.section("Build docker image for public registry")
+            for target in targetsToBuild {
+                actions.phase("Preparing targets for \(target.dockerRef)")
 
-            // Perform Build
-            for target in dockerTargets {
-                actions.section("Preparing targets for \(target.dockerRef)")
-                targetsToPush.append(target)
-
-                if build {
-                    actions.phase("Build docker image")
-                    try target.build()
-                }
-                
-
-                if aliases,
-                   let swiftAliases = SwiftAliases[swiftVersion]
-                {
-                    actions.phase("Create public aliases")
-                    let aliasedTargets = try target.aliases(tags: swiftAliases)
-                    targetsToPush.append(contentsOf: aliasedTargets)
-                    
-                    // If this is a "default" setup the aliases
-                    for aliasedTarget in aliasedTargets {
-                        guard let targetRef = defaultTargets[target.dockerRef] else {
-                            continue
-                        }
-                        
-                        let newTarget = try aliasedTarget.alias(ref: targetRef)
-                        targetsToPush.append(newTarget)
-                        
-                        print("  *===>   \(newTarget.dockerRef)  swift: \(swiftVersion) isLatest: \(swiftVersionIsLatest(swiftVersion))")
-                        if swiftVersionIsLatest(swiftVersion) {
-                            let latestNewTarget = try newTarget.alias(tag: "latest")
-                            targetsToPush.append(latestNewTarget)
-                        }
-                    }
-                }
-                
+                try target.build()
             }
         }
 
-        if push {
-            actions.phase("Push docker image to public registry")
-            try targetsToPush.push()
+        /// Create version aliases for currently defined aliases and targets
+        let targetsPublic = targetsToBuild + targetsToAlias.map { $0.targetCreator }
+        targetsToAlias = targetsPublic.swiftVersionAliases()
+
+        if aliases {
+            actions.section("Create public aliases")
+
+            try targetsToAlias.tag()
         }
         
+        if push {
+            actions.section("Push docker image to public registry")
+            
+            try targetsPublic.push()
+        }
         
         // Support pushing to private registry
-        if let registryUrl = registryUrl {
-            let host = registryUrl.host!
-            
+        if let registryUrl = registryUrl,
+           let host = registryUrl.host
+        {
+            let port = registryUrl.port
+            let targetsPrivateAliases = targetsToAlias.map { $0.dockerCreator }.aliasesForRegistry(url: registryUrl)
+            let targetsPrivate = targetsPrivateAliases.map { $0.targetCreator }
+            let privateTargetsToAlias = targetsPrivate.swiftVersionAliases()
+ 
             if let user = registryUrl.user,
                let password = registryPasswordFromStdin ?? registryPasswordFromArg ?? registryUrl.password {
-                let port = registryUrl.port
                 
                 actions.phase("Login to private docker registry")
-                
-                // TODO: Support --password-stdin
-                print("Attempt to log in: \(user)  pass: \(password)")
-                try actions.runAndPrint(command: "docker", "login", host, "-u", user, "-p", password)
 
-                actions.phase("Create tag for private registry")
+                try actions.runAndPrint(command: "docker", "login", host, "-u", user, "-p", password)
+            }
+            
+            if aliases {
+                actions.section("Create private aliases")
+                try targetsPrivateAliases.tag()
                 
-                for target in targetsToPush {
-                    var aliasesToPush: [DockerCreator] = []
-                    
-                    if aliases {
-                        actions.phase("Create aliases for private registry")
-                        let privateTarget = try target.tag(hostname: host, port: registryUrl.port)
-                        aliasesToPush.append(privateTarget)
-                    } else {
-                        let privateDockerRef = target.dockerRef.with(hostname: host, port: port)
-                        let privateTarget = target.with(ref: privateDockerRef)
-                        aliasesToPush.append(privateTarget)
-                    }
-                    
-                    if push {
-                        actions.phase("Pushing alias to private registry")
-                        try aliasesToPush.push()
-                    }
-                }
+                actions.section("Create private aliases for swift versions")
+                try privateTargetsToAlias.tag()
+            }
+            
+            if push {
+                actions.section("Push docker images to private registry")
+                try targetsPrivateAliases.push()
+                
+                actions.section("Push docker images for swift versions to private registry")
+                try privateTargetsToAlias.push()
             }
         }
     
     }
-
+    
 }
 
 BuildCommand.main()
@@ -319,6 +298,75 @@ struct DockerCreator {
         
         return newDockerCreator
     }
+}
+
+// MARK: Docker Alias
+struct DockerAlias {
+    let dockerCreator: DockerCreator
+    let targetRef: DockerImageRef
+    
+    var targetCreator: DockerCreator {
+        return self.dockerCreator.with(ref: self.targetRef)
+    }
+    
+    /// Create the alias
+    /// - Throws: Any errors from `docker tag`
+    func tag() throws {
+        try self.dockerCreator.alias(ref: self.targetRef)
+    }
+    
+    /// Push the alias to the registry
+    /// - Throws: Any errors from `docker push`
+    func push() throws {
+        try self.targetCreator.push()
+    }
+}
+
+extension Array where Element == DockerAlias {
+    
+    /// An array of `DockerCreator` with the target `DockerImageRef`
+    var targetCreators: [DockerCreator] {
+        return self.map { $0.targetCreator }
+    }
+    
+    /// Create all aliases
+    /// - Throws: Any errors from `docker tag`
+    func tag() throws {
+        for alias in self {
+            try alias.tag()
+        }
+    }
+    
+    /// Push all aliases to the registry
+    /// - Throws: Any errors from `docker push`
+    func push() throws {
+        for alias in self {
+            try alias.push()
+        }
+    }
+}
+
+
+// MARK: DockerCreator Alias Helpers
+
+extension DockerCreator {
+    /// Create Swift Version aliases for a given target
+    /// - Parameter target: DockerCreator (should have a full version number)
+    /// - Returns: New aliases
+    func createSwiftVersionAliases() -> [DockerAlias] {
+        let source = self
+        var aliases: [DockerAlias] = []
+        let currentSwiftVersion = source.dockerRef.tag
+        let swiftAliases = SwiftAliases[currentSwiftVersion] ?? []
+        
+        for swiftVersion in swiftAliases {
+            let targetRef = source.dockerRef.with(tag: swiftVersion)
+            aliases.append(.init(dockerCreator: source, targetRef: targetRef))
+        }
+        return aliases
+    }
+    
+
 }
 
 // MARK: - Misc Helper Functions
@@ -446,6 +494,31 @@ extension Array where Element == DockerCreator {
         for dockerCreator in self {
             try dockerCreator.push()
         }
+    }
+    
+    /// Create SwiftVersion aliases for each DockerCreator
+    /// - Returns: All aliases
+    func swiftVersionAliases() -> [DockerAlias] {
+        return self.flatMap { $0.createSwiftVersionAliases() }
+    }
+    
+    /// Create aliases for a private registry
+    /// - Parameter url: URL must contain a valid hostname and an option port
+    /// - Returns: an empty array of `url` is invalid.  Otherwise a list of alises
+    func aliasesForRegistry(url: URL?) -> [DockerAlias] {
+        guard let url = url else { return [] }
+        let hostname = url.host!
+        let port = url.port
+        var aliases: [DockerAlias] = []
+        
+        for target in self {
+            let newDockerRef = target.dockerRef.with(hostname: hostname, port: port)
+            let alias =  DockerAlias(dockerCreator: target, targetRef: newDockerRef)
+            
+            aliases.append(alias)
+        }
+        
+        return aliases
     }
 }
 
