@@ -14,11 +14,12 @@
 // 	limitations under the License.
 //
 
-import Version          // @mrackwitz
+import Version              // @mrackwitz
 import Foundation
-import ArgumentParser   // https://github.com/apple/swift-argument-parser.git
-import SwiftShell       // @kareman
-import Rainbow          // @onevcat
+import ArgumentParser       // https://github.com/apple/swift-argument-parser.git
+import SwiftShell           // @kareman
+import Rainbow              // @onevcat
+import SwiftShellUtilities  // @Kitura
 
 let SwiftVersions = ["5.0.3", "5.1.5", "5.2.5", "5.3.3"]
 
@@ -99,11 +100,11 @@ struct BuildCommand: ParsableCommand {
         let actions: SystemAction
         
         if enableDryRun {
-            actions = CompositeAction([PrintAction()])
+            actions = SystemActionComposite([SystemActionPrint()])
         } else if verbose {
-            actions = CompositeAction([PrintAction(), RealAction()])
+            actions = SystemActionComposite([SystemActionPrint(), SystemActionReal()])
         } else {
-            actions = CompositeAction([RealAction()])
+            actions = SystemActionComposite([SystemActionReal()])
         }
         
 
@@ -525,151 +526,6 @@ extension Array where Element == DockerCreator {
     }
 }
 
-
-// MARK: - SystemAction
-/// A protocol for high level operations we may perform on the system.
-/// The intent of this protocol is to make it easier to perform "dry-run" operations.
-enum Heading {
-    case section
-    case phase
-}
-
-protocol SystemAction {
-    func heading(_ type: Heading, _ string: String)
-    func createDirectory(url: URL) throws
-    func createFile(fileUrl: URL, content: String) throws
-    func runAndPrint(path: String?, command: [String]) throws
-}
-
-extension SystemAction {
-    /// Print the title of a section
-    /// - Parameter string: title to print
-    func section(_ string: String) {
-        self.heading(.section, string)
-    }
-    
-    /// Print the title of a phase
-    /// - Parameter string: title to print
-    func phase(_ string: String) {
-        self.heading(.phase, string)
-    }
-    
-    /// Create a file at a given path.
-    ///
-    /// This will overwrite existing files.
-    /// - Parameters:
-    ///   - file: fileURL to create
-    ///   - contentBuilder: A closure that returns the content to write into the file.
-    /// - Throws: any problems in creating file.
-    func createFile(fileUrl: URL, _ contentBuilder: ()->String) throws {
-        let content = contentBuilder()
-        try self.createFile(fileUrl: fileUrl, content: content)
-    }
-    
-    /// Execute the given command and show the results
-    /// - Parameters:
-    ///   - path: If not-nil, this will be the current working directory when the command is exectued.
-    ///   - command: Command to execute
-    /// - Throws: any problems in executing the command or if the command has a non-0 return code
-    func runAndPrint(path: String?=nil, command: String...) throws {
-        try self.runAndPrint(path: path, command: command)
-    }
-}
-
-/// Actually perform the function
-class RealAction: SystemAction {
-    func heading(_ type: Heading, _ string: String) {
-        // do nothing
-    }
-    
-    func createDirectory(url: URL) throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: url, withIntermediateDirectories: true, attributes: nil)
-    }
-    
-    /// Create a file at a given path.
-    ///
-    /// This will overwrite existing files.
-    /// - Parameters:
-    ///   - file: fileURL to create
-    ///   - content: Content of file
-    /// - Throws: any problems in creating file.
-    func createFile(fileUrl: URL, content: String) throws {
-        let fm = FileManager.default
-        try? fm.removeItem(at: fileUrl)
-        try content.write(to: fileUrl, atomically: false, encoding: .utf8)
-    }
-    
-    func runAndPrint(path: String?, command: [String]) throws {
-        var context = CustomContext(main)
-        if let path = path {
-            context.currentdirectory = path
-        }
-        let cmd = command.first!
-        var args = command
-        args.removeFirst()
-        try context.runAndPrint(cmd, args)
-    }
-}
-
-/// Only print the actions
-class PrintAction: SystemAction {
-    func heading(_ type: Heading, _ string: String) {
-        switch type {
-        case .section:
-            print(" == Section: \(string)".yellow.bold)
-        case .phase:
-            print(" -- Phase: \(string)".cyan.bold)
-        }
-    }
-    func createDirectory(url: URL) throws {
-        print(" > Creating directory at path: \(url.path)".bold)
-    }
-    
-    func createFile(fileUrl: URL, content: String) throws {
-        print(" > Creating file at path: \(fileUrl.path)".bold)
-        print(content.split(separator: "\n").map { "    " + $0 }.joined(separator: "\n").yellow)
-    }
-    func runAndPrint(path: String?, command: [String]) throws {
-        print(" > Executing command: \(command.joined(separator: " "))".bold)
-        if let path = path {
-            print("   Working Directory: \(path)".bold)
-        }
-    }
-}
-
-/// Allow actions to be composited and performed one after another.
-/// Actions will be performed in the order they are specified in the initializer
-class CompositeAction: SystemAction {
-    var actions: [SystemAction]
-    
-    init(_ actions: [SystemAction] = []) {
-        self.actions = actions
-    }
-    
-    func heading(_ type: Heading, _ string: String) {
-        self.actions.forEach {
-            $0.heading(type, string)
-        }
-    }
-    func createDirectory(url: URL) throws {
-        try self.actions.forEach {
-            try $0.createDirectory(url: url)
-        }
-    }
-    
-    func createFile(fileUrl: URL, content: String) throws {
-        try self.actions.forEach {
-            try $0.createFile(fileUrl: fileUrl, content: content)
-        }
-    }
-
-    func runAndPrint(path: String?, command: [String]) throws {
-        try self.actions.forEach {
-            try $0.runAndPrint(path: path, command: command)
-        }
-    }
-}
 
 // MARK: Docker Image Ref
 
