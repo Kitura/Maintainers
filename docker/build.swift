@@ -21,14 +21,14 @@ import SwiftShell           // @kareman
 import Rainbow              // @onevcat
 import SwiftShellUtilities  // @Kitura
 
-let SwiftVersions = ["5.0.3", "5.1.5", "5.2.5", "5.3.3"]
+let SwiftVersions = ["5.1.5", "5.2.5", "5.3.3", "5.4.1" ]
 
 /// Given a target swift version, what aliases should exist?
 let SwiftAliases = [
-    "5.3.3" : [ "5.3", "5", "latest" ],
+    "5.4.1" : [ "5.4", "5", "latest" ],
+    "5.3.3" : [ "5.3" ],
     "5.2.5" : [ "5.2" ],
     "5.1.5" : [ "5.1" ],
-    "5.0.3" : [ "5.0" ]
     ]
 
 /// Ubuntu Versions to build
@@ -74,6 +74,9 @@ struct BuildCommand: ParsableCommand {
     var registryUrlString: String?
     var registryUrl: URL?
 
+    @Option(name: [.customLong("push-delay")], help: "Seconds before push")
+    var pushDelay: TimeInterval = 3
+
     @Option(name: [.customLong("registry-password")], help: "Registry password")
     var registryPasswordFromArg: String?
 
@@ -84,6 +87,7 @@ struct BuildCommand: ParsableCommand {
         var registryPasswordFromStdin: String? = nil
         var targetsToBuild: [DockerCreator] = []
         var targetsToAlias: [DockerAlias] = []
+        var targetsToAliasFromSource: [DockerAlias] = []
 
         if let urlString = self.registryUrlString {
             self.registryUrl = URL(string: urlString)
@@ -101,6 +105,7 @@ struct BuildCommand: ParsableCommand {
         
         if enableDryRun {
             actions = SystemActionComposite([SystemActionPrint()])
+            pushDelay = 0
         } else if verbose {
             actions = SystemActionComposite([SystemActionPrint(), SystemActionReal()])
         } else {
@@ -130,8 +135,9 @@ struct BuildCommand: ParsableCommand {
                         // Need to save them in defaultTargets[] because they don't exist until after the build phase
                         let defaultCIRef = DockerImageRef(name: "kitura/swift-ci", tag: swiftVersion)
                         let defaultDevRef = DockerImageRef(name: "kitura/swift-dev", tag: swiftVersion)
-                        targetsToAlias.append(.init(dockerCreator: buildCI, targetRef: defaultCIRef))
-                        targetsToAlias.append(.init(dockerCreator: buildDev, targetRef: defaultDevRef))
+
+                        targetsToAliasFromSource.append(.init(dockerCreator: buildCI, targetRef: defaultCIRef))
+                        targetsToAliasFromSource.append(.init(dockerCreator: buildDev, targetRef: defaultDevRef))
                         
                     }
                 }
@@ -161,7 +167,7 @@ struct BuildCommand: ParsableCommand {
         }
 
         /// Create version aliases for currently defined aliases and targets
-        let targetsPublic = targetsToBuild + targetsToAlias.map { $0.targetCreator }
+        let targetsPublic = targetsToBuild + targetsToAliasFromSource.map { $0.dockerCreator } + targetsToAlias.map { $0.targetCreator }
         targetsToAlias = targetsPublic.swiftVersionAliases()
 
         if aliases {
@@ -173,8 +179,8 @@ struct BuildCommand: ParsableCommand {
         if push || pushPublic {
             actions.section("Push docker image to public registry")
             
-            try targetsPublic.push()
-            try targetsToAlias.push()
+            try targetsPublic.push(delay: pushDelay)
+            try targetsToAlias.push(delay: pushDelay)
         }
         
         // Support pushing to private registry
@@ -183,7 +189,7 @@ struct BuildCommand: ParsableCommand {
         {
             let port = registryUrl.port
             let targetsPrivateAliases = targetsToAlias.map { $0.dockerCreator }.aliasesForRegistry(url: registryUrl)
-            let targetsPrivate = targetsPrivateAliases.map { $0.targetCreator }
+            let targetsPrivate = targetsPrivateAliases.map { $0.dockerCreator.with(ref: $0.targetRef) }
             let privateTargetsToAlias = targetsPrivate.swiftVersionAliases()
  
             if let user = registryUrl.user,
@@ -204,10 +210,10 @@ struct BuildCommand: ParsableCommand {
             
             if push || pushPrivate {
                 actions.section("Push docker images to private registry")
-                try targetsPrivateAliases.push()
+                try targetsPrivate.push(delay: pushDelay)
                 
                 actions.section("Push docker images for swift versions to private registry")
-                try privateTargetsToAlias.push()
+                try privateTargetsToAlias.push(delay: pushDelay)
             }
         }
     
@@ -280,7 +286,8 @@ struct DockerCreator {
     ///
     /// Perform a `docker push`
     /// - Throws: Errors from executing `docker push`
-    func push() throws {
+    func push(delay: TimeInterval) throws {
+        sleep(UInt32(delay))
         try self.systemAction.runAndPrint(command: "docker", "push", "\(self.dockerRef)")
     }
     
@@ -297,6 +304,11 @@ struct DockerAlias {
     let dockerCreator: DockerCreator
     let targetRef: DockerImageRef
     
+    init(dockerCreator: DockerCreator, targetRef: DockerImageRef) {
+        self.dockerCreator = dockerCreator
+        self.targetRef = targetRef
+    }
+    
     var targetCreator: DockerCreator {
         return self.dockerCreator.with(ref: self.targetRef)
     }
@@ -309,8 +321,8 @@ struct DockerAlias {
     
     /// Push the alias to the registry
     /// - Throws: Any errors from `docker push`
-    func push() throws {
-        try self.targetCreator.push()
+    func push(delay: TimeInterval) throws {
+        try self.targetCreator.push(delay: delay)
     }
     
     /// Remove the aliased image.
@@ -336,9 +348,9 @@ extension Array where Element == DockerAlias {
     
     /// Push all aliases to the registry
     /// - Throws: Any errors from `docker push`
-    func push() throws {
+    func push(delay: TimeInterval) throws {
         for alias in self {
-            try alias.push()
+            try alias.push(delay: delay)
         }
     }
     
@@ -494,9 +506,9 @@ extension DockerCreator {
 extension Array where Element == DockerCreator {
     /// Convenience method to  apply push() to an array of `DockerCreator`s
     /// - Throws: Any errors on `docker push`
-    func push() throws {
+    func push(delay: TimeInterval) throws {
         for dockerCreator in self {
-            try dockerCreator.push()
+            try dockerCreator.push(delay: delay)
         }
     }
     
