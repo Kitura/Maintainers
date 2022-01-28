@@ -25,7 +25,8 @@ let SwiftVersions = ["5.1.5", "5.2.5", "5.3.3", "5.4.1" ]
 
 /// Given a target swift version, what aliases should exist?
 let SwiftAliases = [
-    "5.4.1" : [ "5.4", "5", "latest" ],
+    "5.5.2" : [ "5.5", "5", "latest" ],
+    "5.4.1" : [ "5.4" ],
     "5.3.3" : [ "5.3" ],
     "5.2.5" : [ "5.2" ],
     "5.1.5" : [ "5.1" ],
@@ -37,6 +38,7 @@ let UbuntuVersions = [ "16.04", "18.04", "20.04" ] // first in this list will be
 /// CentOS Versions to build
 let CentosVersions = [ "8", "7" ]
 let CentosMinimumSwiftVersion = "5.2.5"
+let ContainerCommand = "podman"
 
 struct BuildCommand: ParsableCommand {
     static var configuration = CommandConfiguration(
@@ -197,7 +199,7 @@ struct BuildCommand: ParsableCommand {
                 
                 actions.phase("Login to private docker registry")
 
-                try actions.runAndPrint(command: "docker", "login", host, "-u", user, "-p", password)
+                try actions.runAndPrint(command: ContainerCommand, "login", host, "-u", user, "-p", password)
             }
             
             if aliases {
@@ -264,7 +266,7 @@ struct DockerCreator {
             self.dockerFile
         }
 
-        try self.systemAction.runAndPrint(path: tmpDir.path, command: "docker", "build", "-t", "\(self.dockerRef)", tmpDir.path)
+        try self.systemAction.runAndPrint(workingDir: tmpDir.path, command: ContainerCommand, "build", "-t", "\(self.dockerRef)", tmpDir.path)
     }
     
     /// Tag with a new name entirely.
@@ -277,7 +279,7 @@ struct DockerCreator {
     func tag(ref newDockerRef: DockerImageRef) throws -> DockerCreator {
         let existingRef = self.dockerRef
         
-        try self.systemAction.runAndPrint(command: "docker", "tag", "\(existingRef)", "\(newDockerRef)")
+        try self.systemAction.runAndPrint(command: ContainerCommand, "tag", "\(existingRef)", "\(newDockerRef)")
         
         return self.with(ref: newDockerRef)
     }
@@ -288,14 +290,14 @@ struct DockerCreator {
     /// - Throws: Errors from executing `docker push`
     func push(delay: TimeInterval) throws {
         sleep(UInt32(delay))
-        try self.systemAction.runAndPrint(command: "docker", "push", "\(self.dockerRef)")
+        try self.systemAction.runAndPrint(command: ContainerCommand, "push", "\(self.dockerRef)")
     }
     
     /// Remove the docker image
     ///
     /// Perform a `docker rmi`
     func clean() {
-        try? self.systemAction.runAndPrint(command: "docker", "rmi", "\(self.dockerRef)")
+        try? self.systemAction.runAndPrint(command: ContainerCommand, "rmi", "\(self.dockerRef)")
     }
 }
 
