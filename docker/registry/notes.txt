@@ -1,0 +1,9 @@
+Deploy a registry server
+https://docs.docker.com/registry/deploying/
+
+How to set up a Private Docker Registry using AWS S3
+https://ops.tips/gists/aws-s3-private-docker-registry/
+
+Docker Registry @ Docker Hub
+https://hub.docker.com/_/registry?tab=tags
+
