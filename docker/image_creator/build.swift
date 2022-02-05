@@ -21,7 +21,7 @@ import SwiftShell           // @kareman
 import Rainbow              // @onevcat
 import SwiftShellUtilities  // @Kitura
 
-let SwiftVersions = ["5.1.5", "5.2.5", "5.3.3", "5.4.1" ]
+let SwiftVersions = ["5.1.5", "5.2.5", "5.3.3", "5.4.1", "5.5.2" ]
 
 /// Given a target swift version, what aliases should exist?
 let SwiftAliases = [
@@ -430,6 +430,11 @@ extension DockerCreator {
             RUN apt-get update && apt-get install -y \\
                 git sudo wget pkg-config libcurl4-openssl-dev libssl-dev \\
                 && rm -rf /var/lib/apt/lists/*
+
+            RUN git clone https://github.com/mxcl/swift-sh.git && \
+                (cd swift-sh && swift build -c release) && \
+                cp swift-sh/.build/release/swift-sh /usr/local/bin/swift-sh && \
+                rm -rf swift-sh
             
             RUN mkdir /project
             
@@ -475,7 +480,12 @@ extension DockerCreator {
                     git sudo wget pkgconfig libcurl-devel openssl-devel \\
                     python2-libs \\
                     && yum clean all
-                            
+
+            RUN git clone https://github.com/mxcl/swift-sh.git && \
+                (cd swift-sh && swift build -c release) && \
+                cp swift-sh/.build/release/swift-sh /usr/local/bin/swift-sh && \
+                rm -rf swift-sh
+            
                 RUN mkdir /project
             
                 WORKDIR /project
