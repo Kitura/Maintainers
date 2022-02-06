@@ -21,7 +21,7 @@ import SwiftShell           // @kareman
 import Rainbow              // @onevcat
 import SwiftShellUtilities  // @Kitura
 
-let SwiftVersions = ["5.1.5", "5.2.5", "5.3.3", "5.4.1", "5.5.2" ]
+let SwiftVersions = [ "5.5.2", "5.4.1", "5.3.3", "5.2.5", "5.1.5" ]
 
 /// Given a target swift version, what aliases should exist?
 let SwiftAliases = [
@@ -35,9 +35,9 @@ let SwiftAliases = [
 /// Ubuntu Versions to build
 let UbuntuVersions = [ "16.04", "18.04", "20.04" ] // first in this list will be the "default"
 
-/// CentOS Versions to build
-let CentosVersions = [ "8", "7" ]
-let CentosMinimumSwiftVersion = "5.2.5"
+/// AlmaLinux Versions to build
+let AlmalinuxVersions = [ "8" ]
+let AlmalinuxMinimumSwiftVersion = "5.2.5"
 let ContainerCommand = "podman"
 
 struct BuildCommand: ParsableCommand {
@@ -66,8 +66,8 @@ struct BuildCommand: ParsableCommand {
     @Flag(inversion: .prefixedEnableDisable, help: "Build Ubuntu images (required for CI)")
     var ubuntu: Bool = true
 
-    @Flag(inversion: .prefixedEnableDisable, help: "Build CentOS images")
-    var centos: Bool = false
+    @Flag(inversion: .prefixedEnableDisable, help: "Build AlmaLinux images")
+    var almalinux: Bool = false
 
     @Flag(name: [.customLong("dry-run"), .customShort("n")], help: "Dry-run (print but do not execute commands)")
     var enableDryRun: Bool = false
@@ -145,14 +145,14 @@ struct BuildCommand: ParsableCommand {
                 }
             }
             
-            if centos {
-                for osVersion in CentosVersions {
-                    guard try! Version(swiftVersion) >= Version(CentosMinimumSwiftVersion) else {
+            if almalinux {
+                for osVersion in AlmalinuxVersions {
+                    guard try! Version(swiftVersion) >= Version(AlmalinuxMinimumSwiftVersion) else {
                         break
                     }
                     targetsToBuild.append(contentsOf: [
-                        DockerCreator.centosCI(centosVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions),
-                        DockerCreator.centosDev(centosVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions),
+                        DockerCreator.almalinuxCI(almalinuxVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions),
+                        DockerCreator.almalinuxDev(almalinuxVersion: osVersion, swiftVersion: swiftVersion, systemAction: actions),
                     ])
                 }
             }
@@ -462,47 +462,64 @@ extension DockerCreator {
         return DockerCreator(os: "ubuntu", osVersion: osVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
     
-    // MARK: CentOS
+    // MARK: AlmaLinux
     
-    /// Create CentOS based docker image suitable for CI
+    /// Create AlmaLinux based docker image suitable for CI
     /// This is intended to be the minimum necessary to build Kitura projects for CI.
 
-    static func centosCI(centosVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
-        let dockerRef = DockerImageRef(name: "kitura/swift-ci-centos\(centosVersion)", tag: swiftVersion)
+    static func almalinuxCI(almalinuxVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/swift-ci-almalinux\(almalinuxVersion)", tag: swiftVersion)
 //        let swiftUrl = URL(string: "https://swift.org/builds/swift-\(swiftVersion)-release/centos\(centosVersion)/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos\(centosVersion).tar.gz")!
 //        let swiftTgzFilename = swiftUrl.lastPathComponent
 //        let swiftDirname = swiftTgzFilename.components(separatedBy: ".")[0]
 
         let dockerFile = """
-            FROM swift:\(swiftVersion)-centos\(centosVersion)
-                
-                RUN yum -y install deltarpm || yum -y update && yum -y install \\
-                    git sudo wget pkgconfig libcurl-devel openssl-devel \\
-                    python2-libs \\
-                    && yum clean all
+            # remember to run with --privileged or --cap-add=SYS_PTRACE to support REPL or debug
 
-            RUN git clone https://github.com/mxcl/swift-sh.git && \
+            FROM almalinux:latest
+
+            RUN dnf upgrade --refresh -y && \
+                dnf install -y \
+                    wget \
+                    git sudo wget pkgconfig libcurl-devel openssl-devel \
+                    python2-libs glibc-headers && \
+                dnf clean all
+
+            # This apparently doesn't work... binaries must not be completely compatible
+            RUN cd /opt && \
+                wget https://download.swift.org/swift-\(swiftVersion)-release/centos8/swift-\(swiftVersion)-RELEASE/swift-\(swiftVersion)-RELEASE-centos8.tar.gz && \
+                tar xzf swift-\(swiftVersion)-RELEASE-centos8.tar.gz && \
+                ln -s swift-\(swiftVersion)-RELEASE-centos8 swift && \
+                rm -f swift-\(swiftVersion)-RELEASE-centos8.tar.gz
+
+            ENV PATH="${PATH}:/opt/swift/usr/bin"
+            ENV C_INCLUDE_PATH="/opt/swift/usr/lib/swift/clang/include/"
+            ENV CPLUS_INCLUDE_PATH="${C_INCLUDE_PATH}"
+            ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/swift/usr/lib"
+
+            RUN cd /opt && \
+                git clone https://github.com/mxcl/swift-sh.git && \
                 (cd swift-sh && swift build -c release) && \
                 cp swift-sh/.build/release/swift-sh /usr/local/bin/swift-sh && \
                 rm -rf swift-sh
-            
-                RUN mkdir /project
-            
-                WORKDIR /project
+
+            RUN mkdir /project
+
+            WORKDIR /project
             """
 
-        return DockerCreator(os: "centos", osVersion: centosVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
+        return DockerCreator(os: "almalinux", osVersion: almalinuxVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
     
-    /// Create CentOS based docker image suitable for development
+    /// Create AlmaLinux based docker image suitable for development
     /// This is intended to be a build with packages convenient for local development of Kitura projects.
-    static func centosDev(centosVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
-        let dockerRef = DockerImageRef(name: "kitura/swift-dev-centos\(centosVersion)", tag: swiftVersion)
+    static func almalinuxDev(almalinuxVersion: String, swiftVersion: String, systemAction: SystemAction) -> DockerCreator {
+        let dockerRef = DockerImageRef(name: "kitura/swift-dev-almalinux\(almalinuxVersion)", tag: swiftVersion)
 
         let dockerFile = """
-            FROM kitura/swift-ci-centos\(centosVersion):\(swiftVersion)
+            FROM kitura/swift-ci-almalinux\(almalinuxVersion):\(swiftVersion)
             
-            RUN yum -y update && yum -y install \\
+            RUN dnf -y update && yum -y install \\
                 net-tools iproute nmap \\
                 vim-enhanced \\
                 && yum clean all
@@ -510,7 +527,7 @@ extension DockerCreator {
             WORKDIR /project
             """
         
-        return DockerCreator(os: "centos", osVersion: centosVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
+        return DockerCreator(os: "almalinux", osVersion: almalinuxVersion, systemAction: systemAction, dockerRef: dockerRef, dockerFile: dockerFile)
     }
 }
 
